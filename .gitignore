@@ -1,0 +1,6 @@
+datasets/
+checkpoints/
+logs/
+*.pyc
+*.log
+*.ipynb
