@@ -27,9 +27,9 @@ class CodecConfig:
     f0_max = 12000
     
     # Training
-    batch_size = 16
+    batch_size = 8
     learning_rate = 3e-4
-    max_epochs = 100
+    max_epochs = 500
     grad_clip = 1.0
     
     # Loss weights

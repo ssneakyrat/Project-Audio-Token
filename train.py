@@ -1,6 +1,6 @@
 """
 Training script for VocalTokenizer codec using SingingVoiceDataset.
-Single-GPU/CPU implementation (non-distributed).
+Single-GPU/CPU implementation (non-distributed) with TensorBoard visualization.
 """
 
 import os
@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
+import matplotlib.pyplot as plt
 
 from tqdm import tqdm
 import numpy as np
@@ -97,12 +98,53 @@ def train_epoch(model, discriminator, optimizer, optimizer_d, data_loader, loss_
     return total_loss / len(data_loader)
 
 
-def validate(model, data_loader, loss_fn, device):
+def plot_mel_comparison(target_mel, predicted_mel, title=None):
     """
-    Validate the model
+    Create a figure with target and predicted mel spectrograms side by side.
+    
+    Args:
+        target_mel: Target mel spectrogram numpy array
+        predicted_mel: Predicted mel spectrogram numpy array
+        title: Optional title for the figure
+        
+    Returns:
+        matplotlib figure object
+    """
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    mel_target_aligned = target_mel.transpose(1, 0)
+
+    # Plot target mel
+    im = axes[0].imshow(mel_target_aligned, aspect='auto', origin='lower', interpolation='none')
+    axes[0].set_title('Target Mel Spectrogram')
+    axes[0].set_ylabel('Mel Bins')
+    axes[0].set_xlabel('Frames')
+    
+    # Plot predicted mel
+    im = axes[1].imshow(predicted_mel, aspect='auto', origin='lower', interpolation='none')
+    axes[1].set_title('Predicted Mel Spectrogram')
+    axes[1].set_xlabel('Frames')
+    
+    # Add a colorbar
+    plt.colorbar(im, ax=axes[1])
+    
+    if title:
+        fig.suptitle(title)
+    
+    plt.tight_layout()
+    
+    return fig
+
+
+def validate(model, data_loader, loss_fn, device, writer, epoch):
+    """
+    Validate the model and log mel spectrogram visualizations to TensorBoard
     """
     model.eval()
     total_loss = 0.0
+    
+    # For visualization, only log a few samples
+    max_vis_samples = 4  # Number of samples to visualize
+    vis_sample_count = 0
     
     with torch.no_grad():
         for batch in tqdm(data_loader, desc="Validation"):
@@ -137,6 +179,34 @@ def validate(model, data_loader, loss_fn, device):
             loss = losses['total']
             
             total_loss += loss.item()
+            
+            # Log mel spectrogram visualizations
+            if vis_sample_count < max_vis_samples and 'mel_output' in model_output:
+                # Get predicted and target mel specs
+                predicted_mel = model_output['mel_output']
+                target_mel = mel
+                
+                # Log visualizations for selected samples in the batch
+                for i in range(min(audio.size(0), max_vis_samples - vis_sample_count)):
+                    # Create figure for this sample
+                    fig = plot_mel_comparison(
+                        target_mel[i].cpu().numpy(),
+                        predicted_mel[i].cpu().numpy(),
+                        title=f"Mel Spectrogram Sample {vis_sample_count + i + 1}"
+                    )
+                    
+                    # Log figure to TensorBoard
+                    writer.add_figure(
+                        f'Mel_Comparison/sample_{vis_sample_count + i + 1}',
+                        fig,
+                        global_step=epoch
+                    )
+                
+                vis_sample_count += min(audio.size(0), max_vis_samples - vis_sample_count)
+                
+                # If we've logged enough samples, break the inner loop
+                if vis_sample_count >= max_vis_samples:
+                    break
     
     return total_loss / len(data_loader)
 
@@ -152,6 +222,31 @@ def save_checkpoint(model, optimizer, epoch, loss, path):
         'loss': loss
     }
     torch.save(checkpoint, path)
+
+
+def get_next_experiment_number(base_log_dir):
+    """
+    Get the next experiment number based on existing experiment directories.
+    """
+    if not os.path.exists(base_log_dir):
+        os.makedirs(base_log_dir, exist_ok=True)
+        return 1
+        
+    # Look for directories named "exp_X" where X is a number
+    existing_exps = [d for d in os.listdir(base_log_dir) 
+                     if os.path.isdir(os.path.join(base_log_dir, d)) and d.startswith("exp_")]
+    
+    if not existing_exps:
+        return 1
+        
+    # Extract numbers from directory names
+    exp_numbers = [int(exp.split("_")[1]) for exp in existing_exps if len(exp.split("_")) > 1 and exp.split("_")[1].isdigit()]
+    
+    if not exp_numbers:
+        return 1
+        
+    # Return the next experiment number
+    return max(exp_numbers) + 1
 
 
 def train_model(args):
@@ -270,8 +365,19 @@ def train_model(args):
             collate_fn=standardized_collate_fn
         )
     
-    # Create tensorboard writer
-    writer = SummaryWriter(log_dir=args.log_dir)
+    # Create incremental experiment directory for tensorboard logs
+    exp_number = get_next_experiment_number(args.log_dir)
+    exp_dir = os.path.join(args.log_dir, f"exp_{exp_number}")
+    os.makedirs(exp_dir, exist_ok=True)
+    print(f"Logging to experiment directory: {exp_dir}")
+    
+    # Create tensorboard writer with incremental experiment name
+    writer = SummaryWriter(log_dir=exp_dir)
+    
+    # Create experiment-specific checkpoint directory
+    exp_checkpoint_dir = os.path.join(args.checkpoint_dir, f"exp_{exp_number}")
+    os.makedirs(exp_checkpoint_dir, exist_ok=True)
+    print(f"Saving checkpoints to: {exp_checkpoint_dir}")
     
     # Training loop
     best_val_loss = float('inf')
@@ -284,8 +390,8 @@ def train_model(args):
         # Train for one epoch
         train_loss = train_epoch(model, discriminator, optimizer, optimizer_d, train_loader, loss_fn, device)
         
-        # Validate
-        val_loss = validate(model, val_loader, loss_fn, device)
+        # Validate - pass the writer and epoch number to log visualizations
+        val_loss = validate(model, val_loader, loss_fn, device, writer, epoch)
         
         # Update learning rate
         scheduler.step(val_loss)
@@ -302,15 +408,28 @@ def train_model(args):
             best_val_loss = val_loss
             save_checkpoint(
                 model, optimizer, epoch, val_loss, 
-                os.path.join(args.checkpoint_dir, 'best_model.pt')
+                os.path.join(exp_checkpoint_dir, 'best_model.pt')
             )
         
         # Save regular checkpoint
         if (epoch + 1) % args.save_every == 0:
             save_checkpoint(
                 model, optimizer, epoch, val_loss,
-                os.path.join(args.checkpoint_dir, f'model_epoch_{epoch+1}.pt')
+                os.path.join(exp_checkpoint_dir, f'model_epoch_{epoch+1}.pt')
             )
+    
+    # Add experiment config to tensorboard
+    config_text = (
+        f"Experiment {exp_number}\n"
+        f"Train files: {args.train_files}\n"
+        f"Val files: {args.val_files}\n"
+        f"Context window: {args.context_window_sec} sec\n"
+        f"Batch size: {config.batch_size}\n"
+        f"Learning rate: {config.learning_rate}\n"
+        f"Seed: {args.seed}\n"
+    )
+    writer.add_text('Experiment/config', config_text)
+    writer.close()
 
 
 def main():

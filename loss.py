@@ -77,13 +77,13 @@ class MelReconstructionLoss(nn.Module):
         #print( mel_pred.shape )
         #print( mel_true.shape )
 
-        mek_pred_aligned = mel_pred.permute(0, 2, 1)
+        mel_pred_aligned = mel_pred.permute(0, 2, 1)
 
         # L1 loss
-        l1_loss = F.l1_loss(mek_pred_aligned, mel_true)
+        l1_loss = F.l1_loss(mel_pred_aligned, mel_true)
         
         # L2 loss
-        l2_loss = F.mse_loss(mek_pred_aligned, mel_true)
+        l2_loss = F.mse_loss(mel_pred_aligned, mel_true)
         
         # Combine losses
         loss = l1_loss + l2_loss
